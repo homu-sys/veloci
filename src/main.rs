@@ -433,8 +433,11 @@ async fn install_cmd(
             let _ = target;
             println!("  {}", link.display());
         }
-        if receipt.links.is_empty() {
+        if receipt.links.is_empty() && receipt.conflicts.is_empty() {
             println!("  no binaries found in {}", archive.display());
+        }
+        for (link, owner) in &receipt.conflicts {
+            println!("  {} is taken by {}, not linked", link.display(), owner);
         }
     }
     eprintln!(

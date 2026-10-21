@@ -20,6 +20,9 @@ pub struct Receipt {
     pub files: Vec<PathBuf>,
 
     pub links: Vec<(PathBuf, PathBuf)>,
+
+    #[serde(default)]
+    pub conflicts: Vec<(PathBuf, String)>,
 }
 
 #[derive(Clone, Debug)]
@@ -207,48 +210,63 @@ pub fn find_bins(root: &Path, wanted: &[String], package: &str) -> Vec<PathBuf> 
         }
     }
 
-    let mut executables: Vec<PathBuf> = std::fs::read_dir(root)
-        .map(|entries| {
-            entries
-                .filter_map(|e| e.ok())
-                .map(|e| e.path())
-                .filter(|p| p.is_file() && is_executable(p))
-                .collect()
-        })
-        .unwrap_or_default();
-    if !executables.is_empty() {
-        executables.sort();
-        return executables;
-    }
-
-    let mut found = all_executables(root);
-    found.retain(|p| !is_library(p));
-    found.sort();
-    found
-}
-
-fn all_executables(root: &Path) -> Vec<PathBuf> {
-    let mut stack = vec![root.to_path_buf()];
-    let mut found = Vec::new();
-    while let Some(dir) = stack.pop() {
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            continue;
-        };
-        for entry in entries.filter_map(|e| e.ok()) {
-            let path = entry.path();
-            if path.is_dir() {
-                stack.push(path);
-            } else if is_executable(&path) {
-                found.push(path);
-            }
+    let mut executables = top_level_executables(root);
+    if executables.is_empty() {
+        if let Some(dir) = only_directory(root) {
+            executables = top_level_executables(&dir);
         }
     }
-    found
+    executables
 }
 
-fn is_library(path: &Path) -> bool {
-    let name = path.file_name().unwrap_or_default().to_string_lossy();
-    name.contains(".so") || name.ends_with(".dylib") || name.ends_with(".dll")
+fn top_level_executables(root: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return Vec::new();
+    };
+    let mut executables: Vec<PathBuf> = entries
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.is_file() && is_executable(p) && is_elf(p))
+        .collect();
+    executables.sort();
+    executables
+}
+
+fn only_directory(root: &Path) -> Option<PathBuf> {
+    let entries: Vec<PathBuf> = std::fs::read_dir(root)
+        .ok()?
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.is_dir())
+        .collect();
+    match entries.len() {
+        1 => Some(entries.into_iter().next().unwrap()),
+        _ => None,
+    }
+}
+
+fn is_elf(path: &Path) -> bool {
+    use std::io::Read;
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return false;
+    };
+    let mut magic = [0u8; 4];
+    file.read_exact(&mut magic).is_ok() && &magic == b"\x7fELF"
+}
+
+fn is_program(path: &Path) -> bool {
+    use std::io::{Read, Seek, SeekFrom};
+    if is_elf(path) {
+        return true;
+    }
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return false;
+    };
+    if file.seek(SeekFrom::Start(0)).is_err() {
+        return false;
+    }
+    let mut start = [0u8; 2];
+    file.read_exact(&mut start).is_ok() && &start == b"#!"
 }
 
 fn search(root: &Path, name: &str) -> Option<PathBuf> {
@@ -261,7 +279,10 @@ fn search(root: &Path, name: &str) -> Option<PathBuf> {
             let path = entry.path();
             if path.is_dir() {
                 stack.push(path);
-            } else if path.file_name().is_some_and(|n| n == name) && is_executable(&path) {
+            } else if path.file_name().is_some_and(|n| n == name)
+                && is_executable(&path)
+                && is_program(&path)
+            {
                 return Some(path);
             }
         }
@@ -286,6 +307,7 @@ pub fn install(pkg: &Package, archive: &Path, layout: &Layout) -> Result<Receipt
     let files = unpack(archive, &dest, pkg.strip_prefix.as_deref())?;
 
     let mut links = Vec::new();
+    let mut conflicts = Vec::new();
     for bin in find_bins(&dest, &pkg.bins, &pkg.name) {
         let Some(name) = bin.file_name() else {
             continue;
@@ -296,9 +318,23 @@ pub fn install(pkg: &Package, archive: &Path, layout: &Layout) -> Result<Receipt
                 .with_context(|| format!("creating {}", parent.display()))?;
         }
 
-        if link.exists() || link.symlink_metadata().is_ok() {
-            let _ = std::fs::remove_file(&link);
+        match std::fs::read_link(&link) {
+            Ok(target) if target.starts_with(&dest) => {
+                let _ = std::fs::remove_file(&link);
+            }
+
+            Ok(target) => {
+                conflicts.push((link.clone(), target.display().to_string()));
+                continue;
+            }
+            Err(_) => {
+                if link.exists() {
+                    conflicts.push((link.clone(), "a file that is already there".to_string()));
+                    continue;
+                }
+            }
         }
+
         std::os::unix::fs::symlink(&bin, &link)
             .with_context(|| format!("linking {}", link.display()))?;
         links.push((link, bin));
@@ -313,6 +349,7 @@ pub fn install(pkg: &Package, archive: &Path, layout: &Layout) -> Result<Receipt
         root: dest,
         files,
         links,
+        conflicts,
     };
     write_receipt(&layout.receipt(&pkg.name), &receipt)?;
     Ok(receipt)
@@ -346,12 +383,26 @@ pub fn remove(name: &str, layout: &Layout) -> Result<Receipt> {
             let _ = std::fs::remove_file(link);
         }
     }
+    for link in links_into(&layout.bin, &receipt.root) {
+        let _ = std::fs::remove_file(&link);
+    }
     if receipt.root.exists() {
         std::fs::remove_dir_all(&receipt.root)
             .with_context(|| format!("removing {}", receipt.root.display()))?;
     }
     std::fs::remove_file(&path).with_context(|| format!("removing {}", path.display()))?;
     Ok(receipt)
+}
+
+fn links_into(bin: &Path, root: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(bin) else {
+        return Vec::new();
+    };
+    entries
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| std::fs::read_link(p).is_ok_and(|t| t.starts_with(root)))
+        .collect()
 }
 
 pub fn installed(layout: &Layout) -> Vec<Receipt> {
@@ -397,11 +448,15 @@ mod archive_tests {
         let mut builder = tar::Builder::new(encoder);
 
         let mut header = tar::Header::new_gnu();
-        header.set_size(5);
+        header.set_size(18);
         header.set_mode(0o755);
         header.set_cksum();
         builder
-            .append_data(&mut header, format!("{prefix}/tool"), &b"hello"[..])
+            .append_data(
+                &mut header,
+                format!("{prefix}/tool"),
+                &b"#!/bin/sh\nexit 0\n\n"[..],
+            )
             .unwrap();
 
         let mut header = tar::Header::new_gnu();
@@ -483,5 +538,68 @@ mod archive_tests {
         assert!(!layout.bin.join("tool").exists());
         assert!(!layout.package_dir("tool").exists());
         assert!(installed(&layout).is_empty());
+    }
+
+    #[test]
+    fn leaves_a_name_that_belongs_to_another_package_alone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = archive(tmp.path(), "tool-1.0");
+
+        let layout = Layout {
+            root: tmp.path().join("packages"),
+            bin: tmp.path().join("bin"),
+            receipts: tmp.path().join("receipts"),
+        };
+        std::fs::create_dir_all(&layout.bin).unwrap();
+        let other = tmp.path().join("other");
+        std::fs::create_dir_all(&other).unwrap();
+        let other_tool = other.join("tool");
+        std::fs::write(&other_tool, b"#!/bin/sh\n").unwrap();
+        std::os::unix::fs::symlink(&other_tool, layout.bin.join("tool")).unwrap();
+
+        let pkg = Package {
+            name: "tool".to_string(),
+            version: "1.0".to_string(),
+            url: "https://example.org/tool.tar.gz".to_string(),
+            bins: vec!["tool".to_string()],
+            ..Package::default()
+        };
+
+        let receipt = install(&pkg, &path, &layout).unwrap();
+        assert!(receipt.links.is_empty());
+        assert_eq!(receipt.conflicts.len(), 1);
+        assert_eq!(
+            std::fs::read_link(layout.bin.join("tool")).unwrap(),
+            other_tool
+        );
+    }
+
+    #[test]
+    fn takes_its_own_name_back() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = archive(tmp.path(), "tool-1.0");
+
+        let layout = Layout {
+            root: tmp.path().join("packages"),
+            bin: tmp.path().join("bin"),
+            receipts: tmp.path().join("receipts"),
+        };
+        std::fs::create_dir_all(&layout.bin).unwrap();
+        let mine = tmp.path().join("packages").join("tool").join("tool");
+        std::fs::create_dir_all(mine.parent().unwrap()).unwrap();
+        std::fs::write(&mine, b"#!/bin/sh\n").unwrap();
+        std::os::unix::fs::symlink(&mine, layout.bin.join("tool")).unwrap();
+
+        let pkg = Package {
+            name: "tool".to_string(),
+            version: "1.0".to_string(),
+            url: "https://example.org/tool.tar.gz".to_string(),
+            bins: vec!["tool".to_string()],
+            ..Package::default()
+        };
+
+        let receipt = install(&pkg, &path, &layout).unwrap();
+        assert_eq!(receipt.links.len(), 1);
+        assert!(receipt.conflicts.is_empty());
     }
 }
