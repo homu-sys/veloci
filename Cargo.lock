@@ -1956,6 +1956,7 @@ dependencies = [
  "futures",
  "hex",
  "indicatif",
+ "libc",
  "lzma-rs",
  "reqwest",
  "ruzstd",

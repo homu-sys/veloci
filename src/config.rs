@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -13,6 +14,9 @@ pub struct Repo {
 pub struct Config {
     #[serde(default)]
     pub repo: Vec<Repo>,
+
+    #[serde(default, flatten)]
+    pub extra: HashMap<String, toml::Value>,
 }
 
 impl Config {

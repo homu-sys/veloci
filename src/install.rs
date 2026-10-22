@@ -32,18 +32,37 @@ pub struct Layout {
     pub bin: PathBuf,
 
     pub receipts: PathBuf,
+
+    pub applications: PathBuf,
+
+    pub icons: PathBuf,
+
+    pub man: PathBuf,
 }
 
 impl Layout {
     pub fn user() -> Self {
         let data = dirs::data_local_dir().unwrap_or_else(|| PathBuf::from(".veloci"));
-        let bin = dirs::home_dir()
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join(".local/bin");
+        let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+        let bin = home.join(".local/bin");
         Self {
             root: data.join("veloci/packages"),
             bin,
             receipts: data.join("veloci/receipts"),
+            applications: data.join("applications"),
+            icons: data.join("icons/hicolor"),
+            man: data.join("man"),
+        }
+    }
+
+    pub fn system() -> Self {
+        Self {
+            root: PathBuf::from("/usr/local/lib/veloci/packages"),
+            bin: PathBuf::from("/usr/local/bin"),
+            receipts: PathBuf::from("/usr/local/lib/veloci/receipts"),
+            applications: PathBuf::from("/usr/local/share/applications"),
+            icons: PathBuf::from("/usr/local/share/icons/hicolor"),
+            man: PathBuf::from("/usr/local/share/man"),
         }
     }
 
@@ -340,13 +359,16 @@ pub fn install(pkg: &Package, archive: &Path, layout: &Layout) -> Result<Receipt
         links.push((link, bin));
     }
 
+    install_desktop(&dest, layout)?;
+    install_man(&dest, layout)?;
+
     let receipt = Receipt {
         name: pkg.name.clone(),
         version: pkg.version.clone(),
         description: pkg.description.clone(),
         url: pkg.url.clone(),
         sha256: pkg.sha256.clone(),
-        root: dest,
+        root: dest.clone(),
         files,
         links,
         conflicts,
@@ -403,6 +425,99 @@ fn links_into(bin: &Path, root: &Path) -> Vec<PathBuf> {
         .map(|e| e.path())
         .filter(|p| std::fs::read_link(p).is_ok_and(|t| t.starts_with(root)))
         .collect()
+}
+
+fn install_desktop(src: &Path, layout: &Layout) -> Result<()> {
+    for entry in walk_files(src) {
+        if entry.extension().is_some_and(|e| e == "desktop")
+            && entry
+                .components()
+                .any(|c| matches!(c, std::path::Component::Normal(x) if x == "applications"))
+        {
+            if let Some(name) = entry.file_name() {
+                let dest = layout.applications.join(name);
+                if let Some(parent) = dest.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                let _ = std::fs::remove_file(&dest);
+                let _ = std::fs::copy(&entry, &dest);
+                let _ = std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o644));
+            }
+        }
+    }
+
+    for entry in walk_files(src) {
+        if entry
+            .extension()
+            .is_some_and(|e| e == "png" || e == "svg" || e == "xpm")
+            && entry
+                .components()
+                .any(|c| matches!(c, std::path::Component::Normal(x) if x == "icons"))
+        {
+            if let Some(name) = entry.file_name() {
+                let dest = layout.icons.join(name);
+                if let Some(parent) = dest.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                let _ = std::fs::remove_file(&dest);
+                let _ = std::fs::copy(&entry, &dest);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn install_man(src: &Path, layout: &Layout) -> Result<()> {
+    for entry in walk_files(src) {
+        if entry
+            .components()
+            .any(|c| matches!(c, std::path::Component::Normal(x) if x == "man"))
+        {
+            let Ok(rel) = entry.strip_prefix(src) else {
+                continue;
+            };
+            if rel
+                .components()
+                .next()
+                .is_some_and(|c| matches!(c, std::path::Component::Normal(x) if x == "man"))
+            {
+                let rel = rel.strip_prefix("man").unwrap_or(rel);
+                let dest = layout.man.join(rel);
+                if let Some(parent) = dest.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                if entry.is_dir() {
+                    let _ = std::fs::create_dir_all(&dest);
+                    continue;
+                }
+                if entry.is_file() {
+                    let _ = std::fs::remove_file(&dest);
+                    let _ = std::fs::copy(&entry, &dest);
+                    let _ = std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o644));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn walk_files(root: &Path) -> Vec<PathBuf> {
+    let mut stack = vec![root.to_path_buf()];
+    let mut out = Vec::new();
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.filter_map(|e| e.ok()) {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.is_file() {
+                out.push(path);
+            }
+        }
+    }
+    out
 }
 
 pub fn installed(layout: &Layout) -> Vec<Receipt> {
@@ -513,6 +628,9 @@ mod archive_tests {
             root: tmp.path().join("packages"),
             bin: tmp.path().join("bin"),
             receipts: tmp.path().join("receipts"),
+            applications: tmp.path().join("applications"),
+            icons: tmp.path().join("icons"),
+            man: tmp.path().join("man"),
         };
         let pkg = Package {
             name: "tool".to_string(),
@@ -549,6 +667,9 @@ mod archive_tests {
             root: tmp.path().join("packages"),
             bin: tmp.path().join("bin"),
             receipts: tmp.path().join("receipts"),
+            applications: tmp.path().join("applications"),
+            icons: tmp.path().join("icons"),
+            man: tmp.path().join("man"),
         };
         std::fs::create_dir_all(&layout.bin).unwrap();
         let other = tmp.path().join("other");
@@ -583,6 +704,9 @@ mod archive_tests {
             root: tmp.path().join("packages"),
             bin: tmp.path().join("bin"),
             receipts: tmp.path().join("receipts"),
+            applications: tmp.path().join("applications"),
+            icons: tmp.path().join("icons"),
+            man: tmp.path().join("man"),
         };
         std::fs::create_dir_all(&layout.bin).unwrap();
         let mine = tmp.path().join("packages").join("tool").join("tool");

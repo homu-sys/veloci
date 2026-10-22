@@ -32,6 +32,12 @@ struct Cli {
     )]
     concurrency: usize,
 
+    #[arg(long, help = "Install system-wide")]
+    system: bool,
+
+    #[arg(long, help = "Force system-wide install (alias for --system)")]
+    sudo: bool,
+
     #[command(subcommand)]
     cmd: Command,
 }
@@ -93,6 +99,9 @@ enum Command {
 
     #[command(about = "List the installed packages")]
     List {
+        #[arg(help = "Package names to list")]
+        packages: Vec<String>,
+
         #[arg(long, help = "The directory packages are unpacked into")]
         root: Option<PathBuf>,
 
@@ -142,14 +151,27 @@ async fn main() -> Result<()> {
             bin,
             yes,
         } => {
-            return install_cmd(packages, root, bin, cli.index.clone(), cli.concurrency, yes).await
+            return install_cmd(
+                packages,
+                root,
+                bin,
+                cli.index.clone(),
+                cli.concurrency,
+                yes,
+                cli.system || cli.sudo,
+            )
+            .await
         }
         Command::Remove {
             packages,
             root,
             bin,
-        } => return remove_cmd(packages, root, bin),
-        Command::List { root, bin } => return list_cmd(root, bin),
+        } => return remove_cmd(packages, root, bin, cli.system || cli.sudo),
+        Command::List {
+            packages,
+            root,
+            bin,
+        } => return list_cmd(packages, root, bin, cli.system || cli.sudo),
         cmd => {
             let t0 = Instant::now();
             let index = load_index(cli.index.as_deref().unwrap_or_default()).await?;
@@ -345,7 +367,21 @@ async fn index_cmd(cmd: IndexCmd) -> Result<()> {
     Ok(())
 }
 
-fn layout(root: Option<PathBuf>, bin: Option<PathBuf>) -> install::Layout {
+fn is_root() -> bool {
+    unsafe { libc::geteuid() == 0 }
+}
+
+fn layout(root: Option<PathBuf>, bin: Option<PathBuf>, system: bool) -> install::Layout {
+    if system || is_root() {
+        let mut layout = install::Layout::system();
+        if let Some(root) = root {
+            layout.root = root;
+        }
+        if let Some(bin) = bin {
+            layout.bin = bin;
+        }
+        return layout;
+    }
     let mut layout = install::Layout::user();
     if let Some(root) = root {
         layout.root = root;
@@ -363,12 +399,13 @@ async fn install_cmd(
     index: Option<String>,
     concurrency: usize,
     yes: bool,
+    system: bool,
 ) -> Result<()> {
     if packages.is_empty() {
         anyhow::bail!("nothing to install");
     }
 
-    let layout = layout(root, bin);
+    let layout = layout(root, bin, system);
     let t0 = Instant::now();
     let index = load_index(index.as_deref().unwrap_or_default()).await?;
     let index_mirrors = index.mirrors().to_vec();
@@ -461,8 +498,13 @@ async fn confirm(question: &str) -> Result<bool> {
     Ok(answer.is_empty() || answer == "y" || answer == "yes")
 }
 
-fn remove_cmd(packages: Vec<String>, root: Option<PathBuf>, bin: Option<PathBuf>) -> Result<()> {
-    let layout = layout(root, bin);
+fn remove_cmd(
+    packages: Vec<String>,
+    root: Option<PathBuf>,
+    bin: Option<PathBuf>,
+    system: bool,
+) -> Result<()> {
+    let layout = layout(root, bin, system);
     for name in &packages {
         let receipt = install::remove(name, &layout)?;
         println!("removed {} {}", receipt.name, receipt.version);
@@ -470,14 +512,24 @@ fn remove_cmd(packages: Vec<String>, root: Option<PathBuf>, bin: Option<PathBuf>
     Ok(())
 }
 
-fn list_cmd(root: Option<PathBuf>, bin: Option<PathBuf>) -> Result<()> {
-    let layout = layout(root, bin);
+fn list_cmd(
+    packages: Vec<String>,
+    root: Option<PathBuf>,
+    bin: Option<PathBuf>,
+    system: bool,
+) -> Result<()> {
+    let layout = layout(root, bin, system);
     let receipts = install::installed(&layout);
     if receipts.is_empty() {
-        println!("nothing installed");
+        if packages.is_empty() {
+            println!("nothing installed");
+        }
         return Ok(());
     }
     for receipt in receipts {
+        if !packages.is_empty() && !packages.iter().any(|p| p == &receipt.name) {
+            continue;
+        }
         let description = receipt
             .description
             .as_deref()
